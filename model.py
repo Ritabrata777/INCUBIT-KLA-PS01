@@ -6,14 +6,14 @@ Building blocks:
 - SimpleGate: activation-free gating (channel-split + elementwise multiply).
 - SimplifiedChannelAttention (SCA): cheap channel attention via global
   average pooling + a single 1x1 conv, with no activation function at all.
+- LayerNorm2d: FP16-safe channel-wise normalization.
 - NAFBlock: LayerNorm + depthwise-conv spatial mixing (with SCA) followed
   by a SimpleGate-based channel-mixing FFN, all activation-function-free.
 - NAFNet_SR: NAFNet body operating on a low-resolution input, followed by
   a Sub-pixel Convolution (PixelShuffle) head that upsamples back to full
-  (clean) resolution.
+  resolution with a long bicubic residual skip.
 
-Accepts 1-channel grayscale input, produces 1-channel restored grayscale
-output.
+Accepts 1-channel grayscale input, produces 1-channel restored grayscale output.
 """
 
 import torch
@@ -33,8 +33,7 @@ class SimpleGate(nn.Module):
 
 class SimplifiedChannelAttention(nn.Module):
     """Simplified Channel Attention (SCA): global average pool followed by
-    a single 1x1 convolution -- no activation, no bottleneck MLP. Far
-    cheaper than SE-style attention while retaining most of the benefit."""
+    a single 1x1 convolution -- no activation, no bottleneck MLP."""
 
     def __init__(self, channels: int):
         super().__init__()
@@ -47,9 +46,8 @@ class SimplifiedChannelAttention(nn.Module):
 
 
 class LayerNorm2d(nn.Module):
-    """Channel-wise LayerNorm applied directly to NCHW tensors, as used
-    throughout NAFNet (normalizes across the channel dimension at every
-    spatial location)."""
+    """Channel-wise LayerNorm applied directly to NCHW tensors.
+    Calculates statistics in FP32 for numerical stability under FP16 autocast."""
 
     def __init__(self, channels: int, eps: float = 1e-6):
         super().__init__()
@@ -58,26 +56,17 @@ class LayerNorm2d(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mu = x.mean(dim=1, keepdim=True)
-        var = x.var(dim=1, keepdim=True, unbiased=False)
-        x = (x - mu) / torch.sqrt(var + self.eps)
-        return x * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
+        dtype = x.dtype
+        x_fp32 = x.float()
+        mu = x_fp32.mean(dim=1, keepdim=True)
+        var = x_fp32.var(dim=1, keepdim=True, unbiased=False)
+        normalized = (x_fp32 - mu) / torch.sqrt(var + self.eps)
+        out = normalized.to(dtype) * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
+        return out
 
 
 class NAFBlock(nn.Module):
-    """
-    Nonlinear Activation Free Block.
-
-    Spatial mixing branch:
-        LayerNorm -> 1x1 conv (expand) -> depthwise 3x3 conv -> SimpleGate
-        -> Simplified Channel Attention -> 1x1 conv (project) -> residual
-
-    Channel mixing (FFN) branch:
-        LayerNorm -> 1x1 conv (expand) -> SimpleGate -> 1x1 conv (project)
-        -> residual
-
-    No ReLU/GELU/etc. appears anywhere in this block.
-    """
+    """Nonlinear Activation Free Block."""
 
     def __init__(self, channels: int, expand_ratio: int = 2, ffn_expand_ratio: int = 2):
         super().__init__()
@@ -101,12 +90,12 @@ class NAFBlock(nn.Module):
         self.sg2 = SimpleGate()
         self.conv4 = nn.Conv2d(ffn_channels // 2, channels, kernel_size=1, bias=True)
 
-        # Learnable residual scaling factors (as in the original NAFNet).
+        # Learnable residual scaling factors
         self.beta = nn.Parameter(torch.ones((1, channels, 1, 1)))
         self.gamma = nn.Parameter(torch.ones((1, channels, 1, 1)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Spatial mixing.
+        # Spatial mixing
         residual = x
         y = self.norm1(x)
         y = self.conv1(y)
@@ -116,7 +105,7 @@ class NAFBlock(nn.Module):
         y = self.conv2(y)
         x = residual + y * self.beta
 
-        # Channel mixing.
+        # Channel mixing
         residual = x
         y = self.norm2(x)
         y = self.conv3(y)
@@ -126,28 +115,15 @@ class NAFBlock(nn.Module):
 
 
 class NAFNet_SR(nn.Module):
-    """
-    NAFNet-SR: a NAFNet body operating at low resolution followed by a
-    Sub-pixel Convolution (PixelShuffle) upsampling head that restores
-    the image to full (clean) resolution.
-
-    Args:
-        in_channels: number of input channels (1 for grayscale).
-        out_channels: number of output channels (1 for grayscale).
-        width: base feature width of the NAFNet body.
-        num_blocks: number of stacked NAFBlocks in the body.
-        upscale_factor: spatial upscaling ratio applied by the
-            PixelShuffle head (must match the downsampling factor used by
-            the degradation pipeline / dataset during training).
-    """
+    """NAFNet-SR architecture with PixelShuffle upsampling head."""
 
     def __init__(
         self,
         in_channels: int = 1,
         out_channels: int = 1,
-        width: int = 32,
+        width: int = 64,          # Updated default width for optimal capacity
         num_blocks: int = 8,
-        upscale_factor: int = 4,
+        upscale_factor: int = 2,  # Updated default to 2x matching KLA dataset
     ):
         super().__init__()
         self.upscale_factor = upscale_factor
@@ -156,7 +132,7 @@ class NAFNet_SR(nn.Module):
         self.body = nn.Sequential(*[NAFBlock(width) for _ in range(num_blocks)])
         self.body_tail_conv = nn.Conv2d(width, width, kernel_size=3, padding=1, bias=True)
 
-        # Sub-pixel convolution (PixelShuffle) upsampling head.
+        # Sub-pixel convolution (PixelShuffle) upsampling head
         up_channels = out_channels * (upscale_factor ** 2)
         self.upsample = nn.Sequential(
             nn.Conv2d(width, up_channels, kernel_size=3, padding=1, bias=True),
@@ -173,9 +149,7 @@ class NAFNet_SR(nn.Module):
         out = self.upsample(feat)
         out = self.final_conv(out)
 
-        # Long residual skip: the network only needs to learn a residual
-        # correction on top of a simple bicubic upsample of the (noisy,
-        # low-res) input, rather than reconstructing the image from scratch.
+        # Long residual skip: add bicubic upsampled base input
         base = F.interpolate(
             x, scale_factor=self.upscale_factor, mode="bicubic", align_corners=False
         )
