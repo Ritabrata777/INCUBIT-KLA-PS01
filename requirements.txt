@@ -1,0 +1,18 @@
+# Core dependencies for NAFNet-SR semiconductor image restoration.
+#
+# IMPORTANT: torch / torchvision / torchaudio are CUDA-build-specific and
+# should NOT be installed straight from this file with a plain
+# `pip install -r requirements.txt` if you need GPU support. Install them
+# first with the correct CUDA index for your machine, e.g. for CUDA 12.8
+# (compatible with driver CUDA 12.9 and NVIDIA H100 GPUs):
+#
+#   pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+#
+# Then install the remaining dependencies below:
+#
+#   pip install -r requirements.txt
+#
+# See https://pytorch.org/get-started/locally/ for other CUDA versions.
+
+opencv-python>=4.9,<5
+numpy>=2.0,<3

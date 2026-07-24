@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Dataset (large, reproducible via prepare_carinthia.py / make_demo_testset.py)
+data/
+
+# Raw dataset download artifacts (not needed once data/ is prepared)
+carinthia_data.zip
+carinthia_raw/
+
+# Ad-hoc single-image test outputs
+single_test_output/
+single_test_output_*/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
