@@ -78,11 +78,27 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save restored images")
     parser.add_argument("--weights_path", type=str, default="final_model_weights.pt", help="Path to trained model weights")
     parser.add_argument("--batch_size", type=int, default=32, help="Inference batch size (>=16 recommended on H100)")
-    parser.add_argument("--upscale_factor", type=int, default=4)
+    parser.add_argument("--upscale_factor", type=int, default=2, help="Default set to 2x for KLA downsampled dataset")
     parser.add_argument("--width", type=int, default=32)
     parser.add_argument("--num_blocks", type=int, default=8)
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=4, help="Safe worker count for docker environments")
     return parser.parse_args()
+
+
+def load_checkpoint(model, weights_path, device):
+    """Robust weights loader that automatically strips module. or _orig_mod. prefixes."""
+    state_dict = torch.load(weights_path, map_location=device)
+    
+    # Handle nested state_dict dictionaries (e.g. if saved with optimizer/epoch)
+    if isinstance(state_dict, dict) and "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+        
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        name = k.replace("module.", "").replace("_orig_mod.", "")
+        new_state_dict[name] = v
+        
+    model.load_state_dict(new_state_dict)
 
 
 def main():
@@ -102,8 +118,7 @@ def main():
         upscale_factor=args.upscale_factor,
     ).to(device)
 
-    state_dict = torch.load(args.weights_path, map_location=device)
-    model.load_state_dict(state_dict)
+    load_checkpoint(model, args.weights_path, device)
     model.eval()
 
     dataset = InferenceDataset(args.input_dir)
@@ -112,7 +127,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
         collate_fn=pad_collate,
     )
 
@@ -123,7 +138,7 @@ def main():
         for batch_tensor, names, heights, widths in loader:
             batch_tensor = batch_tensor.to(device, non_blocking=True)
 
-            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 output = model(batch_tensor)
 
             # Cast back to fp32 before clamping/quantizing for numerically
