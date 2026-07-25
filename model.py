@@ -1,53 +1,19 @@
-"""
-model.py
-NAFNet-SR: Nonlinear Activation Free Network for Super-Resolution.
+"""NAFNet-SR: Nonlinear Activation Free Network for image restoration + SR.
 
-Building blocks:
-- SimpleGate: activation-free gating (channel-split + elementwise multiply).
-- SimplifiedChannelAttention (SCA): cheap channel attention via global
-  average pooling + a single 1x1 conv, with no activation function at all.
-- LayerNorm2d: FP16-safe channel-wise normalization.
-- NAFBlock: LayerNorm + depthwise-conv spatial mixing (with SCA) followed
-  by a SimpleGate-based channel-mixing FFN, all activation-function-free.
-- NAFNet_SR: NAFNet body operating on a low-resolution input, followed by
-  a Sub-pixel Convolution (PixelShuffle) head that upsamples back to full
-  resolution with a long bicubic residual skip.
-
-Accepts 1-channel grayscale input, produces 1-channel restored grayscale output.
+Grayscale (1-channel) in, grayscale (1-channel) out. Final PixelShuffle upsample
+lets the same model function as a super-resolution head; when `upscale=1` the
+network acts purely as a restoration model at the input resolution.
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SimpleGate(nn.Module):
-    """Splits the channel dimension in half and multiplies the two halves
-    together. Entirely removes the need for a nonlinear activation
-    function (ReLU/GELU/etc.)."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=1)
-        return x1 * x2
-
-
-class SimplifiedChannelAttention(nn.Module):
-    """Simplified Channel Attention (SCA): global average pool followed by
-    a single 1x1 convolution -- no activation, no bottleneck MLP."""
-
-    def __init__(self, channels: int):
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        attn = self.conv(self.pool(x))
-        return x * attn
-
-
 class LayerNorm2d(nn.Module):
-    """Channel-wise LayerNorm applied directly to NCHW tensors.
-    Calculates statistics in FP32 for numerical stability under FP16 autocast."""
+    """Channel-wise LayerNorm for (N, C, H, W) tensors."""
 
     def __init__(self, channels: int, eps: float = 1e-6):
         super().__init__()
@@ -56,101 +22,170 @@ class LayerNorm2d(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x_fp32 = x.float()
-        mu = x_fp32.mean(dim=1, keepdim=True)
-        var = x_fp32.var(dim=1, keepdim=True, unbiased=False)
-        normalized = (x_fp32 - mu) / torch.sqrt(var + self.eps)
-        out = normalized.to(dtype) * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
-        return out
+        mu = x.mean(dim=1, keepdim=True)
+        var = x.var(dim=1, keepdim=True, unbiased=False)
+        x = (x - mu) / torch.sqrt(var + self.eps)
+        return x * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+
+
+class SimpleGate(nn.Module):
+    """Splits the channel dim in half and returns their elementwise product."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a, b = x.chunk(2, dim=1)
+        return a * b
+
+
+class SimplifiedChannelAttention(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.fc(self.pool(x))
+        return x * w
 
 
 class NAFBlock(nn.Module):
-    """Nonlinear Activation Free Block."""
-
-    def __init__(self, channels: int, expand_ratio: int = 2, ffn_expand_ratio: int = 2):
+    def __init__(self, c: int, dw_expand: int = 2, ffn_expand: int = 2, drop_path: float = 0.0):
         super().__init__()
-        dw_channels = channels * expand_ratio
+        dw_c = c * dw_expand
 
-        # --- Spatial mixing branch ---
-        self.norm1 = LayerNorm2d(channels)
-        self.conv1 = nn.Conv2d(channels, dw_channels, kernel_size=1, bias=True)
-        self.dwconv = nn.Conv2d(
-            dw_channels, dw_channels, kernel_size=3, padding=1,
-            groups=dw_channels, bias=True,
-        )
+        self.norm1 = LayerNorm2d(c)
+        self.conv1 = nn.Conv2d(c, dw_c, 1, 1, 0)
+        self.conv2 = nn.Conv2d(dw_c, dw_c, 3, 1, 1, groups=dw_c)  # depthwise
         self.sg1 = SimpleGate()
-        self.sca = SimplifiedChannelAttention(dw_channels // 2)
-        self.conv2 = nn.Conv2d(dw_channels // 2, channels, kernel_size=1, bias=True)
+        self.sca = SimplifiedChannelAttention(dw_c // 2)
+        self.conv3 = nn.Conv2d(dw_c // 2, c, 1, 1, 0)
 
-        # --- Channel mixing (FFN) branch ---
-        ffn_channels = channels * ffn_expand_ratio
-        self.norm2 = LayerNorm2d(channels)
-        self.conv3 = nn.Conv2d(channels, ffn_channels, kernel_size=1, bias=True)
+        self.norm2 = LayerNorm2d(c)
+        ffn_c = c * ffn_expand
+        self.conv4 = nn.Conv2d(c, ffn_c, 1, 1, 0)
         self.sg2 = SimpleGate()
-        self.conv4 = nn.Conv2d(ffn_channels // 2, channels, kernel_size=1, bias=True)
+        self.conv5 = nn.Conv2d(ffn_c // 2, c, 1, 1, 0)
 
-        # Learnable residual scaling factors
-        self.beta = nn.Parameter(torch.ones((1, channels, 1, 1)))
-        self.gamma = nn.Parameter(torch.ones((1, channels, 1, 1)))
+        self.beta = nn.Parameter(torch.zeros(1, c, 1, 1))
+        self.gamma = nn.Parameter(torch.zeros(1, c, 1, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Spatial mixing
-        residual = x
         y = self.norm1(x)
         y = self.conv1(y)
-        y = self.dwconv(y)
+        y = self.conv2(y)
         y = self.sg1(y)
         y = self.sca(y)
-        y = self.conv2(y)
-        x = residual + y * self.beta
-
-        # Channel mixing
-        residual = x
-        y = self.norm2(x)
         y = self.conv3(y)
-        y = self.sg2(y)
+        x = x + y * self.beta
+
+        y = self.norm2(x)
         y = self.conv4(y)
-        return residual + y * self.gamma
+        y = self.sg2(y)
+        y = self.conv5(y)
+        return x + y * self.gamma
 
 
 class NAFNet_SR(nn.Module):
-    """NAFNet-SR architecture with PixelShuffle upsampling head."""
+    """Encoder-decoder NAFNet with a PixelShuffle super-resolution tail.
+
+    Args:
+        in_channels: input channels (1 for grayscale).
+        out_channels: output channels (1 for grayscale).
+        width: base feature width.
+        enc_blocks: NAFBlocks per encoder stage.
+        middle_blocks: NAFBlocks at the bottleneck.
+        dec_blocks: NAFBlocks per decoder stage.
+        upscale: final PixelShuffle spatial scale factor (1, 2, or 4).
+    """
 
     def __init__(
         self,
         in_channels: int = 1,
         out_channels: int = 1,
-        width: int = 64,          # Updated default width for optimal capacity
-        num_blocks: int = 8,
-        upscale_factor: int = 2,  # Updated default to 2x matching KLA dataset
+        width: int = 32,
+        enc_blocks=(2, 2, 4),
+        middle_blocks: int = 8,
+        dec_blocks=(2, 2, 2),
+        upscale: int = 1,
     ):
         super().__init__()
-        self.upscale_factor = upscale_factor
+        assert upscale in (1, 2, 4), "upscale must be 1, 2, or 4"
+        self.upscale = upscale
 
-        self.intro = nn.Conv2d(in_channels, width, kernel_size=3, padding=1, bias=True)
-        self.body = nn.Sequential(*[NAFBlock(width) for _ in range(num_blocks)])
-        self.body_tail_conv = nn.Conv2d(width, width, kernel_size=3, padding=1, bias=True)
+        self.intro = nn.Conv2d(in_channels, width, 3, 1, 1)
 
-        # Sub-pixel convolution (PixelShuffle) upsampling head
-        up_channels = out_channels * (upscale_factor ** 2)
-        self.upsample = nn.Sequential(
-            nn.Conv2d(width, up_channels, kernel_size=3, padding=1, bias=True),
-            nn.PixelShuffle(upscale_factor),
-        )
-        self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=True)
+        self.encoders = nn.ModuleList()
+        self.downs = nn.ModuleList()
+        chan = width
+        for n in enc_blocks:
+            self.encoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(n)]))
+            self.downs.append(nn.Conv2d(chan, chan * 2, 2, 2))
+            chan *= 2
+
+        self.middle = nn.Sequential(*[NAFBlock(chan) for _ in range(middle_blocks)])
+
+        self.ups = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        for n in dec_blocks:
+            self.ups.append(
+                nn.Sequential(
+                    nn.Conv2d(chan, chan * 2, 1, bias=False),
+                    nn.PixelShuffle(2),
+                )
+            )
+            chan //= 2
+            self.decoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(n)]))
+
+        # Super-resolution tail (PixelShuffle-based)
+        if upscale > 1:
+            tail = []
+            tc = chan
+            up = upscale
+            while up > 1:
+                tail += [nn.Conv2d(tc, tc * 4, 3, 1, 1), nn.PixelShuffle(2)]
+                up //= 2
+            tail += [nn.Conv2d(tc, out_channels, 3, 1, 1)]
+            self.tail = nn.Sequential(*tail)
+        else:
+            self.tail = nn.Conv2d(chan, out_channels, 3, 1, 1)
+
+        self.padder_size = 2 ** len(enc_blocks)
+
+    def _pad(self, x: torch.Tensor):
+        _, _, h, w = x.shape
+        ph = (self.padder_size - h % self.padder_size) % self.padder_size
+        pw = (self.padder_size - w % self.padder_size) % self.padder_size
+        if ph or pw:
+            x = F.pad(x, (0, pw, 0, ph), mode="reflect")
+        return x, h, w
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        inp = x
+        x, h, w = self._pad(x)
+
         feat = self.intro(x)
-        body_feat = self.body(feat)
-        body_feat = self.body_tail_conv(body_feat)
-        feat = feat + body_feat
+        skips = []
+        for enc, down in zip(self.encoders, self.downs):
+            feat = enc(feat)
+            skips.append(feat)
+            feat = down(feat)
 
-        out = self.upsample(feat)
-        out = self.final_conv(out)
+        feat = self.middle(feat)
 
-        # Long residual skip: add bicubic upsampled base input
-        base = F.interpolate(
-            x, scale_factor=self.upscale_factor, mode="bicubic", align_corners=False
-        )
-        return out + base
+        for up, dec, skip in zip(self.ups, self.decoders, reversed(skips)):
+            feat = up(feat)
+            feat = feat + skip
+            feat = dec(feat)
+
+        out = self.tail(feat)
+
+        # Global residual: upsample input to match output scale
+        if self.upscale > 1:
+            inp_up = F.interpolate(
+                inp, scale_factor=self.upscale, mode="bilinear", align_corners=False
+            )
+            # Crop tail output to original padded region * upscale
+            out = out[:, :, : h * self.upscale, : w * self.upscale]
+            out = out + inp_up
+        else:
+            out = out[:, :, :h, :w] + inp
+        return out

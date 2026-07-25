@@ -1,162 +1,170 @@
-"""
-evaluation.py
-Batch inference script for NAFNet-SR semiconductor image restoration.
-
-Optimized for NVIDIA H100 throughput:
-  - Batched processing (batch_size >= 16/32), never a single-image loop.
-  - torch.amp.autocast('cuda') FP16 mixed-precision inference.
-  - torch.no_grad() to disable autograd bookkeeping entirely.
+"""Batched FP16 inference for semiconductor image restoration on H100.
 
 Usage:
-    python evaluation.py --input_dir path/to/test_images \
-        --output_dir path/to/restored_images \
-        --weights_path final_model_weights.pt
+    python evaluation.py --input_dir path/to/degraded --output_dir path/to/out \
+        --weights final_model_weights.pt --batch_size 32
 """
+
+from __future__ import annotations
 
 import argparse
 import os
+import time
 from pathlib import Path
 
-import cv2
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
+from PIL import Image
+from torch.amp import autocast
 
 from model import NAFNet_SR
 
-IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 
-class InferenceDataset(Dataset):
-    """Loads grayscale test images for batched inference, keeping track of
-    each image's original size so padding added for batching can be
-    cropped away after the model runs."""
-
-    def __init__(self, input_dir: str):
-        self.paths = sorted(
-            str(p) for p in Path(input_dir).iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS
-        )
-        if len(self.paths) == 0:
-            raise RuntimeError(f"No images found in input_dir: {input_dir}")
-
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, idx):
-        path = self.paths[idx]
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise FileNotFoundError(f"Could not read image: {path}")
-        tensor = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)  # (1, H, W)
-        return tensor, os.path.basename(path), img.shape[0], img.shape[1]
+def list_images(folder: Path) -> list[Path]:
+    return sorted(p for p in folder.rglob("*") if p.suffix.lower() in IMG_EXTS)
 
 
-def pad_collate(batch):
-    """Pads all images in a batch (via edge replication) to the max H/W
-    present in that batch, so variably-sized test images can still be
-    processed together in a single batched forward pass."""
-    tensors, names, heights, widths = zip(*batch)
-    max_h = max(heights)
-    max_w = max(widths)
+def load_gray(path: Path, backend: str = "pil") -> np.ndarray:
+    """Decode a grayscale image to float32 numpy in [0, 1] using the chosen backend."""
+    if backend == "cv2":
+        try:
+            import cv2  # type: ignore
+            try:
+                cv2.setNumThreads(1)
+            except Exception:
+                pass
+            arr = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            if arr is not None:
+                return arr.astype(np.float32) / 255.0
+        except Exception:
+            pass
+    if backend == "torchvision":
+        try:
+            from torchvision.io import decode_image, read_file, ImageReadMode  # type: ignore
+            img = decode_image(read_file(str(path)), mode=ImageReadMode.GRAY)
+            return img.squeeze(0).numpy().astype(np.float32) / 255.0
+        except Exception:
+            pass
+    return np.asarray(Image.open(path).convert("L"), dtype=np.float32) / 255.0
 
-    padded = []
-    for t in tensors:
-        _, h, w = t.shape
-        pad_h = max_h - h
-        pad_w = max_w - w
-        if pad_h > 0 or pad_w > 0:
-            t = torch.nn.functional.pad(t, (0, pad_w, 0, pad_h), mode="replicate")
-        padded.append(t)
 
-    batch_tensor = torch.stack(padded, dim=0)
-    return batch_tensor, list(names), list(heights), list(widths)
+
+def save_gray_uint8(path: Path, arr: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.clip(arr, 0.0, 1.0) * 255.0
+    arr = np.rint(arr).astype(np.uint8)
+    Image.fromarray(arr, mode="L").save(path)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Batched FP16 inference for NAFNet-SR")
-    parser.add_argument("--input_dir", type=str, required=True, help="Directory of degraded test images")
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save restored images")
-    parser.add_argument("--weights_path", type=str, default="final_model_weights.pt", help="Path to trained model weights")
-    parser.add_argument("--batch_size", type=int, default=32, help="Inference batch size (>=16 recommended on H100)")
-    parser.add_argument("--upscale_factor", type=int, default=2, help="Default set to 2x for KLA downsampled dataset")
-    parser.add_argument("--width", type=int, default=32)
-    parser.add_argument("--num_blocks", type=int, default=8)
-    parser.add_argument("--num_workers", type=int, default=4, help="Safe worker count for docker environments")
-    return parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--input_dir", type=str, required=True)
+    p.add_argument("--output_dir", type=str, required=True)
+    p.add_argument("--weights", type=str, default="final_model_weights.pt")
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--width", type=int, default=32)
+    p.add_argument("--upscale", type=int, default=1)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--image_backend", choices=["pil", "torchvision", "cv2"],
+                   default="pil", help="Image decoder backend for loading inputs.")
+    p.add_argument("--seed", type=int, default=42,
+                   help="RNG seed for python/numpy/torch (CPU+CUDA).")
+    p.add_argument("--deterministic", action="store_true",
+                   help="Force deterministic algorithms and disable cuDNN autotune. "
+                        "Note: FP16 autocast may still introduce tiny non-determinism.")
+    return p.parse_args()
 
 
-def load_checkpoint(model, weights_path, device):
-    """Robust weights loader that automatically strips module. or _orig_mod. prefixes."""
-    state_dict = torch.load(weights_path, map_location=device)
-    
-    # Handle nested state_dict dictionaries (e.g. if saved with optimizer/epoch)
-    if isinstance(state_dict, dict) and "state_dict" in state_dict:
-        state_dict = state_dict["state_dict"]
-        
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        name = k.replace("module.", "").replace("_orig_mod.", "")
-        new_state_dict[name] = v
-        
-    model.load_state_dict(new_state_dict)
+def set_reproducibility(seed: int, deterministic: bool) -> None:
+    """Seed python/numpy/torch and configure cuDNN for reproducible inference."""
+    import random
+    import numpy as np
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception as e:
+            print(f"[repro] use_deterministic_algorithms failed: {e}")
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+
+
+
+@torch.no_grad()
+def run_batch(model: torch.nn.Module, batch_np: list[np.ndarray], device) -> list[np.ndarray]:
+    """Run inference on a batch of images that share the same H, W."""
+    x = torch.from_numpy(np.stack(batch_np, axis=0)).unsqueeze(1).to(device, non_blocking=True)
+    with autocast("cuda", dtype=torch.float16, enabled=device.type == "cuda"):
+        y = model(x)
+    y = y.float().clamp(0.0, 1.0).squeeze(1).cpu().numpy()
+    return [y[i] for i in range(y.shape[0])]
 
 
 def main():
     args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+    in_dir = Path(args.input_dir)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
+    set_reproducibility(args.seed, args.deterministic)
+    if args.deterministic:
+        print(f"[repro] deterministic inference (seed={args.seed}, cudnn.benchmark=False)")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    if device.type != "cuda":
-        print("WARNING: CUDA not available -- falling back to CPU, FP16 autocast will be disabled.")
 
-    model = NAFNet_SR(
-        in_channels=1,
-        out_channels=1,
-        width=args.width,
-        num_blocks=args.num_blocks,
-        upscale_factor=args.upscale_factor,
-    ).to(device)
 
-    load_checkpoint(model, args.weights_path, device)
+    # ---- load model ----
+    ckpt = torch.load(args.weights, map_location=device)
+    saved_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+    width = saved_args.get("width", args.width)
+    upscale = saved_args.get("upscale", args.upscale)
+    model = NAFNet_SR(in_channels=1, out_channels=1, width=width, upscale=upscale).to(device)
+    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    model.load_state_dict(state, strict=True)
     model.eval()
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
 
-    dataset = InferenceDataset(args.input_dir)
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=pad_collate,
-    )
+    paths = list_images(in_dir)
+    print(f"Found {len(paths)} images. Running batched FP16 inference on {device}.")
 
-    scale = args.upscale_factor
-    total_images = 0
+    # Group by (H, W) so we can build true batches without padding overhead.
+    groups: dict[tuple[int, int], list[tuple[Path, np.ndarray]]] = {}
+    for p in paths:
+        arr = load_gray(p, args.image_backend)
+        groups.setdefault(arr.shape, []).append((p, arr))
 
-    with torch.no_grad():
-        for batch_tensor, names, heights, widths in loader:
-            batch_tensor = batch_tensor.to(device, non_blocking=True)
+    t0 = time.time()
+    n_done = 0
+    for shape, items in groups.items():
+        for i in range(0, len(items), args.batch_size):
+            chunk = items[i : i + args.batch_size]
+            imgs = [a for _, a in chunk]
+            outs = run_batch(model, imgs, device)
+            for (path, _), out_arr in zip(chunk, outs):
+                rel = path.relative_to(in_dir)
+                out_path = out_dir / rel
+                # Preserve original filename & extension.
+                save_gray_uint8(out_path, out_arr)
+                n_done += 1
 
-            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                output = model(batch_tensor)
-
-            # Cast back to fp32 before clamping/quantizing for numerically
-            # stable, deterministic rounding to uint8.
-            output = output.float()
-            output = torch.clamp(output, 0.0, 1.0)
-            output_uint8 = (output * 255.0).round().to(torch.uint8).cpu().numpy()
-
-            for i, name in enumerate(names):
-                out_h = heights[i] * scale
-                out_w = widths[i] * scale
-                restored = output_uint8[i, 0, :out_h, :out_w]
-
-                out_path = os.path.join(args.output_dir, name)
-                cv2.imwrite(out_path, restored)
-                total_images += 1
-
-    print(f"Restored {total_images} images. Saved to {args.output_dir}")
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    dt = time.time() - t0
+    print(f"Processed {n_done} images in {dt:.2f}s ({n_done / max(dt, 1e-6):.2f} img/s).")
 
 
 if __name__ == "__main__":

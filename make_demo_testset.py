@@ -65,7 +65,7 @@ def main():
         img = img[:h, :w]
 
         clean_tensor = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
-        degraded_tensor, _ = pipeline.apply_degradation(clean_tensor, scale=scale)
+        degraded_tensor = pipeline.apply_degradation(clean_tensor)
 
         degraded_np = degraded_tensor.squeeze(0).numpy()
         degraded_np = np.clip(degraded_np, 0.0, 1.0)
