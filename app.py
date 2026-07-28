@@ -106,10 +106,13 @@ def _load_model(weights_path: str, width: int, upscale: int):
 
     if is_old_flat:
         # Old flat architecture: body.0..N, body_tail_conv, upsample, final_conv
-        # Infer num_blocks from the highest body index present
+        # Infer hyper-params from tensor shapes (checkpoint has no args dict).
         num_blocks = max(
             int(k.split(".")[1]) for k in keys if k.startswith("body.")
         ) + 1
+        resolved_width = int(state_dict["intro.weight"].shape[0])
+        up_ch = int(state_dict["upsample.0.weight"].shape[0])
+        resolved_upscale = int(round(up_ch ** 0.5))
         model = _OldNAFNet_SR(
             in_channels=1,
             out_channels=1,
@@ -190,11 +193,12 @@ class _OldNAFNet_SR(torch.nn.Module):
         self.intro         = torch.nn.Conv2d(in_channels, width, 3, 1, 1)
         self.body          = torch.nn.Sequential(*[_OldNAFBlock(width) for _ in range(num_blocks)])
         self.body_tail_conv = torch.nn.Conv2d(width, width, 3, 1, 1)
+        # Matches bundled final_model_weights.pt: conv -> upscale^2 ch -> PixelShuffle
         self.upsample      = torch.nn.Sequential(
-            torch.nn.Conv2d(width, width * (upscale_factor**2), 3, 1, 1),
+            torch.nn.Conv2d(width, upscale_factor ** 2, 3, 1, 1),
             torch.nn.PixelShuffle(upscale_factor),
         )
-        self.final_conv    = torch.nn.Conv2d(width, out_channels, 3, 1, 1)
+        self.final_conv    = torch.nn.Conv2d(1, out_channels, 3, 1, 1)
     def forward(self, x):
         inp = x
         x   = self.intro(x)
@@ -547,7 +551,7 @@ DEFAULT_WEIGHTS = str(Path(__file__).parent / "final_model_weights.pt")
 
 
 def build_ui():
-    with gr.Blocks(title="NAFNet-SR — Semiconductor Image Restoration", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="NAFNet-SR — Semiconductor Image Restoration") as demo:
 
         gr.Markdown(
             """
@@ -691,4 +695,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     demo = build_ui()
-    demo.launch(share=args.share, server_port=args.port)
+    demo.launch(share=args.share, server_port=args.port, theme=gr.themes.Soft())
